@@ -1,7 +1,6 @@
 from threading import Lock, Thread
 import random
-from utils import PositionManager as PosMan
-
+import time
 
 class Environment:
     def __init__(self, n):
@@ -11,12 +10,14 @@ class Environment:
         self.mutex_grid = []
         self.threads = []
         self.update = False
+        self.activeAgent = 0
+        self.screen_updated = False
         for _ in range(self.grid_size):
             self.mutex_grid.append(Lock())
 
     def add_agent(self, agent):
         self.agents[agent.position] = agent
-        self.threads.append(Thread(target=agent.run, args=(), daemon=True))
+        self.threads.append(Thread(target=agent.run, args=(), daemon=True, name="Agent-%i" % agent.id))
 
     def get_neighbors(self, pos, check=None):
         if check is None:
@@ -33,6 +34,9 @@ class Environment:
             neighbors.append(pos - 1)
         return neighbors
 
+    def get_all_neighbors(self, pos):
+        return self.get_neighbors(pos, lambda _: True)
+
     def is_empty(self, pos):
         for p in list(self.agents.keys()):
             if p == pos:
@@ -40,22 +44,18 @@ class Environment:
         return True
 
     def next_move(self, agent, pos):
+        while not self.screen_updated:
+            time.sleep(0.1)
         self.mutex_grid[pos].acquire()
         has_move = False
         try:
             if self.is_empty(pos):
-                print("[%i] move : %i%a -> %i%a" %
-                      (agent.id, agent.position, PosMan.pos_2D(agent.position, self.n),
-                       pos, PosMan.pos_2D(pos, self.n)))
                 self.agents.pop(agent.position)
                 agent.position = pos
                 self.agents[agent.position] = agent
                 has_move = True
-            else:
-                print("[%i!!!] move : %i%a -> %i%a" %
-                      (agent.id, agent.position, PosMan.pos_2D(agent.position, self.n),
-                       pos, PosMan.pos_2D(pos, self.n)))
         finally:
+            self.screen_updated = False
             self.mutex_grid[pos].release()
         if has_move:
             self.update = True
@@ -74,25 +74,26 @@ class Environment:
 
     def is_finish(self):
         for agent in list(self.agents.values()):
-            f = not (agent.end or agent.stuck)
-            if f:
+            if not (agent.end or agent.stuck):
                 return False
         return True
 
     def __str__(self):
         str_ = ""
         for i in range(self.n):
-            str_ += "# "
+            str_ += "#  "
         for i in range(self.grid_size):
             if i % self.n == 0:
                 str_ += "\n"
             if self.is_empty(i):
-                str_ += "_ "
+                str_ += "__ "
             else:
+                if self.agents[i].id < 10:
+                    str_ += " "
                 str_ += str(self.agents[i].id) + " "
         str_ += "\n"
         for i in range(self.n):
-            str_ += "# "
+            str_ += "#  "
 
         return str_
 
