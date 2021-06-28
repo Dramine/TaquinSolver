@@ -1,6 +1,5 @@
 from threading import Lock, Thread
 import random
-from utils import PositionManager as PosMan
 
 
 class Environment:
@@ -48,9 +47,6 @@ class Environment:
         has_move = False
         try:
             if self.is_empty(pos):
-                print("[%i] move : %i%a -> %i%a" %
-                      (agent.id, agent.position, PosMan.pos_2D(agent.position, self.n),
-                       pos, PosMan.pos_2D(pos, self.n)))
                 self.agents.pop(agent.position)
                 agent.position = pos
                 self.agents[agent.position] = agent
@@ -74,8 +70,7 @@ class Environment:
 
     def is_finish(self):
         for agent in list(self.agents.values()):
-            # if not (agent.end or agent.stuck):
-            if not agent.end:
+            if not (agent.end or agent.stuck):
                 return False
         return True
 

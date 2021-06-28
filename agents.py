@@ -1,6 +1,5 @@
 import random
 import time
-import enum
 from heapq import heappop
 from heapq import heappush
 from utils import PositionManager as PosMan
@@ -160,7 +159,6 @@ class Messenger:
     def ack(self, receiver):
         self.send(receiver, ACKMessage(self.id))
         self.received_messages.pop(receiver)
-        print("%i ack to %i" % (self.id, receiver.id))
 
     def ack_handler(self, sender):
         self.received_messages.pop(sender)
@@ -250,7 +248,6 @@ class InteractiveAgent(DijkstraAgent, Messenger):
 
     def send(self, receiver, message):
         if isinstance(message, GiveWayMessage):
-            print("%i send to %i with priority : %i" % (self.id, receiver.id, message.priority))
             self.waiting = True
         super().send(receiver, message)
 
@@ -261,7 +258,6 @@ class InteractiveAgent(DijkstraAgent, Messenger):
 
     def run(self):
         while True:
-            # time.sleep(0.2)
             if self.received_messages:
                 self.handle_messages()
             elif (not (self.stuck or self.waiting or self.end)) and self.env.activeAgent == self.id:
@@ -283,7 +279,6 @@ class InteractiveAgent(DijkstraAgent, Messenger):
 
     def give_way_handler(self, sender):
         if self.waiting:
-            # print("[%i] Je dors %i" % (self.id, sender.id))
             return
 
         message = self.received_messages[sender]
@@ -305,7 +300,6 @@ class InteractiveAgent(DijkstraAgent, Messenger):
 
     def lets_turn_handler(self, sender):
         if self.waiting:
-            # print("[%i] Je dors %i" % (self.id, sender.id))
             return
 
         def empty_handler(pos):
@@ -331,7 +325,7 @@ class InteractiveAgent(DijkstraAgent, Messenger):
         def is_servant(pos):
             if pos in self.env.agents:
                 agent = self.env.agents[pos]
-                return isinstance(agent, Messenger) and receiver not in self.received_messages \
+                return isinstance(agent, Messenger) and agent not in self.received_messages \
                        and agent.id > priority and agent.id != self.id
             else:
                 return True
