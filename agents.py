@@ -1,8 +1,8 @@
 import random
 import time
+import enum
 from heapq import heappop
 from heapq import heappush
-from threading import Thread
 from utils import PositionManager as PosMan
 
 
@@ -21,7 +21,7 @@ class Agent:
 
     @staticmethod
     def get_closer(source, target, n, get_neighbors):
-        closers = PosMan.get_closers(source, target, n, get_neighbors)
+        closers = PosMan.get_closers_neighbors(source, target, n, get_neighbors)
         if closers:
             return random.choice(closers)
         else:
@@ -29,7 +29,7 @@ class Agent:
 
     @staticmethod
     def get_farther(source, target, n, get_neighbors):
-        farthers = PosMan.get_closers(source, target, n, get_neighbors)
+        farthers = PosMan.get_closers_neighbors(source, target, n, get_neighbors)
         if farthers:
             return random.choice(farthers)
         else:
@@ -39,14 +39,15 @@ class Agent:
         pass
 
     def run(self):
-        while not self.position == self.target:
+        while not self.end:
             time.sleep(0.2)
             if not self.stuck:
                 try:
                     self.move(self.position, self.target)
                 except NoPathFoundException:
                     self.stuck = True
-        self.end = True
+            if self.position == self.target:
+                self.end = True
 
     def __str__(self):
         return str(self.id)
@@ -65,7 +66,8 @@ class DijkstraAgent(Agent):
     def __init__(self, id_, position, target, env):
         super().__init__(id_, position, target, env)
 
-    def dijkstra(self, source, target):
+    @staticmethod
+    def dijkstra(source, target, get_neighbors):
         prev = {}
         graph = set()
         distance = {source: 0}
@@ -78,7 +80,7 @@ class DijkstraAgent(Agent):
 
             graph.add(node)
 
-            for neighbor in self.env.get_neighbors(node):
+            for neighbor in get_neighbors(node):
                 if neighbor in graph:
                     continue
                 dist_neighbor = dist_node + 1
@@ -99,26 +101,32 @@ class DijkstraAgent(Agent):
         return path
 
     def move(self, source, target):
-        path = self.dijkstra(source, target)
+        path = self.dijkstra(source, target, self.env.get_neighbors)
         self.env.next_move(self, path[1])
 
 
 class Message:
+    def __init__(self, priority):
+        self.priority = priority
+
+
+class ACKMessage(Message):
     pass
 
 
 class GiveWayMessage(Message):
-    def __init__(self, move_from):
-        self.move_from = move_from
+    def __init__(self, chain, priority):
+        super().__init__(priority)
+        self.chain = chain
 
     def __str__(self):
-        return "{move_from: %i}" % self.move_from
+        return "{chain: %a with priority: %i}" % (self.chain, self.priority)
 
     def __repr__(self):
         return self.__str__()
 
 
-class ACKMessage(Message):
+class LetsTurnMessage(Message):
     pass
 
 
@@ -127,11 +135,15 @@ class Messenger:
         self.id = id_
         self.handler = {}
         self.received_messages = {}
-        self.sended_messages = {}
         self.handler[ACKMessage] = self.ack_handler
 
     def receive(self, sender, message):
-        self.received_messages[sender] = message
+        if sender in self.received_messages:
+            old_message = self.received_messages[sender]
+            if old_message.priority > message.priority:
+                self.received_messages[sender] = message
+        else:
+            self.received_messages[sender] = message
 
     def handle_messages(self):
         if not self.received_messages:
@@ -141,134 +153,252 @@ class Messenger:
             for msg_type in self.handler:
                 if isinstance(message, msg_type):
                     self.handler[msg_type](sender)
-                    break
 
     def send(self, receiver, message):
         receiver.receive(self, message)
-        self.sended_messages[receiver] = message
 
     def ack(self, receiver):
-        self.send(receiver, ACKMessage())
+        self.send(receiver, ACKMessage(self.id))
         self.received_messages.pop(receiver)
+        print("%i ack to %i" % (self.id, receiver.id))
 
     def ack_handler(self, sender):
-        self.sended_messages.pop(sender)
         self.received_messages.pop(sender)
 
 
-class InteractiveDijkstraAgent(DijkstraAgent, Messenger):
+class Actuator:
+    def __init__(self, agent):
+        self.agent = agent
+        self.can_end = False
+
+    def do(self, source, target):
+        pass
+
+
+class DirectWayActuator(Actuator):
+    def __init__(self, agent):
+        super().__init__(agent)
+        self.can_end = False
+
+    def do(self, source, target):
+        if source == target:
+            self.can_end = True
+            return True
+        return self.agent.move_or_send_give_way(source, target, self.agent.id)
+
+
+class N2Actuator(Actuator):
+    def __init__(self, agent, target_bis):
+        super().__init__(agent)
+        self.target_bis = target_bis
+
+    def do(self, source, target):
+        if source == self.target_bis:
+            self.can_end = True
+            return True
+        return self.agent.move_or_send_give_way(source, self.target_bis, self.agent.id)
+
+
+class N1Actuator(N2Actuator):
+    def __init__(self, agent, target_bis, master_id):
+        super().__init__(agent, target_bis)
+        self.master_id = master_id
+
+    def do(self, source, target):
+        if source == target:
+            self.can_end = True
+            return True
+        if source == self.target_bis:
+            return self.agent.move_or_send_lets_turn(target)
+        return self.agent.move_or_send_give_way(source, self.target_bis, self.master_id)
+
+
+class InteractiveAgent(DijkstraAgent, Messenger):
     def __init__(self, id_, position, target, env):
         DijkstraAgent.__init__(self, id_, position, target, env)
         Messenger.__init__(self, id_)
         self.handler[GiveWayMessage] = self.give_way_handler
+        self.handler[LetsTurnMessage] = self.lets_turn_handler
+        self.waiting = False
+        self.next = 1
+        self.actuator = self.create_actuator()
+
+    def create_actuator(self):
+        n = self.env.n
+        target_2d = PosMan.pos_2D(self.id, n)
+        if (target_2d[0] < n - 2 and target_2d[1] < n - 2) or (target_2d[0] == n-1 and target_2d[1] == n - 2):
+            return DirectWayActuator(self)
+        elif target_2d[0] >= n - 2 > target_2d[1]:
+            if target_2d[0] == n - 2:
+                target_bis = PosMan.pos_1D(n - 1, (self.id // n), n)
+                return N2Actuator(self, target_bis)
+            elif target_2d[0] == n - 1:
+                target_bis = PosMan.pos_1D(n - 1, (self.id // n) + 1, n)
+                return N1Actuator(self, target_bis, self.id - 1)
+        elif target_2d[1] >= n - 2:
+            if target_2d[1] == n - 2:
+                self.next = n
+                target_bis = PosMan.pos_1D((self.id % n), n - 1, n)
+                return N2Actuator(self, target_bis)
+            elif target_2d[1] == n - 1:
+                self.next = -n + 1
+                target_bis = PosMan.pos_1D((self.id % n) + 1, n - 1, n)
+                return N1Actuator(self, target_bis, self.id - n)
 
     def receive(self, sender, message):
         super().receive(sender, message)
-        # if self.end:
-        #     self.end = False
-        #     self.env.threads[self.id] = Thread(target=self.run, args=(), daemon=True)
-        #     self.env.threads[self.id].start()
+
+    def send(self, receiver, message):
+        if isinstance(message, GiveWayMessage):
+            print("%i send to %i with priority : %i" % (self.id, receiver.id, message.priority))
+            self.waiting = True
+        super().send(receiver, message)
+
+    def move(self, source, target):
+        did = self.actuator.do(source, target)
+        if not did:
+            raise NoPathFoundException
 
     def run(self):
-        while not self.position == self.target:
-            time.sleep(0.2)
-            if not self.stuck:
+        while True:
+            # time.sleep(0.2)
+            if self.received_messages:
+                self.handle_messages()
+            elif (not (self.stuck or self.waiting or self.end)) and self.env.activeAgent == self.id:
                 try:
                     self.move(self.position, self.target)
                 except NoPathFoundException:
-                    self.move_or_send_give_way()
-            elif self.received_messages:
-                self.handle_messages()
-        self.end = True
+                    self.stuck = True
+            if self.actuator.can_end:
+                if self.position == self.target:
+                    self.end = True
+                    self.stuck = False
+                if self.env.activeAgent == self.id and not self.waiting:
+                    self.env.activeAgent += self.next
+
+    def ack_handler(self, sender):
+        super().ack_handler(sender)
+        self.waiting = False
+        self.stuck = False
 
     def give_way_handler(self, sender):
+        if self.waiting:
+            # print("[%i] Je dors %i" % (self.id, sender.id))
+            return
+
         message = self.received_messages[sender]
-        if self.position != message.move_from:
+        if self.position != message.chain[0] or len(message.chain) < 2:
             self.ack(sender)
             return
-        print("%i -> %i : %s" % (sender.id, self.id, str(message)))
-        self.ack(sender)
-        # has_move = self.move_or_send_give_way(sender.target, self.get_farther)
-        # if has_move:
-        #     self.ack(sender)
 
-    # def move_or_send_give_way(self, target, find):
-    #     def check(p):
-    #         if self.env.is_empty(p):
-    #             return True
-    #         else:
-    #             agent = self.env.agents[p]
-    #             return agent.id not in self.received_messages
-    #
-    #     def get_neighbors(p):
-    #         return self.env.get_neighbors(p, check)
-    #
-    #     try:
-    #         pos = find(self.position, target, self.env.n, get_neighbors)
-    #         if self.env.is_empty(pos):
-    #             return self.env.next_move(self, pos)
-    #         else:
-    #             self.stuck = True
-    #             if not self.sended_messages:
-    #                 receiver = self.env.agents[pos]
-    #                 if isinstance(receiver, Messenger) and receiver not in self.received_messages:
-    #                     self.send(receiver, GiveWayMessage(pos))
-    #                 return False
-    #     except NoPathFoundException:
-    #         self.stuck = True
-    #         return False
-
-    def move_or_send_give_way(self):
-        def get_neighbors(p):
-            return self.env.get_neighbors(p, lambda _: True)
-
-        closers = PosMan.get_closers(self.position, self.target, self.env.n, get_neighbors)
-        empty_closers = []
-        fill_closers = []
-        for closer in closers:
-            if self.env.is_empty(closer):
-                empty_closers.append(closer)
-            else:
-                fill_closers.append(closer)
-
-        while empty_closers:
-            closer_i = random.randint(0, len(empty_closers) - 1)
-            closer = empty_closers[closer_i]
-            has_move = self.env.next_move(self, closer)
-            if has_move:
-                return True
-            empty_closers.pop(closer_i)
-
-        self.stuck = True
-        while fill_closers:
-            closer_i = random.randint(0, len(fill_closers)-1)
-            closer = fill_closers[closer_i]
+        pos = message.chain[1]
+        if self.env.is_empty(pos):
+            self.env.next_move(self, pos)
+            self.ack(sender)
+        else:
             try:
-                receiver = self.env.agents[closer]
-                if isinstance(receiver, Messenger) and receiver not in self.received_messages:
-                    self.send(receiver, GiveWayMessage(closer))
-                    return False
+                receiver = self.env.agents[pos]
+                path = message.chain[1:]
+                self.send(receiver, GiveWayMessage(path, message.priority))
             except KeyError:
                 pass
-            fill_closers.pop(closer_i)
 
-    def give_way(self):
+    def lets_turn_handler(self, sender):
+        if self.waiting:
+            # print("[%i] Je dors %i" % (self.id, sender.id))
+            return
+
+        def empty_handler(pos):
+            return self.env.next_move(self, pos)
+
+        def fill_handler(pos):
+            try:
+                receiver = self.env.agents[pos]
+                if isinstance(receiver, Messenger) and receiver not in self.received_messages \
+                        and receiver.id > self.id:
+                    return self.send_give_way(receiver, self.id)
+            except KeyError:
+                pass
+            return False
+
+        closers = PosMan.get_closers_neighbors(self.position, self.target, self.env.n, self.env.get_all_neighbors)
+        old_pos = self.position
+        self.do_for_empty_or_then_fill(closers, empty_handler, fill_handler)
+        if old_pos != self.position:
+            self.ack(sender)
+
+    def send_give_way(self, receiver, priority):
+        def is_servant(pos):
+            if pos in self.env.agents:
+                agent = self.env.agents[pos]
+                return isinstance(agent, Messenger) and receiver not in self.received_messages \
+                       and agent.id > priority and agent.id != self.id
+            else:
+                return True
+
+        def get_neighbors(pos):
+            return self.env.get_neighbors(pos, is_servant)
+
+        closers_empty = PosMan.get_closers_empty(receiver.position, self.env.n, self.env.is_empty)
+        closer_empty = random.choice(closers_empty)
         try:
-            closer = self.get_closer(self.position, self.target, self.env.n, self.env.get_neighbors)
-            return self.env.next_move(self, closer)
+            path = self.dijkstra(receiver.position, closer_empty, get_neighbors)
+            self.send(receiver, GiveWayMessage(path, priority))
+            return True
         except NoPathFoundException:
-            def get_neighbors(p):
-                return self.env.get_neighbors(p, lambda _: True)
+            return False
 
-            closers = PosMan.get_closers(self.position, self.target, self.env.n, get_neighbors)
-            while closers:
-                closer_i = random.randint(0, len(closers) - 1)
-                closer = closers[closer_i]
-                try:
-                    receiver = self.env.agents[closer]
-                    if isinstance(receiver, Messenger) and receiver not in self.received_messages:
-                        self.send(receiver, GiveWayMessage(closer))
-                        return False
-                except KeyError:
-                    pass
-                closers.pop(closer_i)
+    def move_or_send_lets_turn(self, target):
+        if self.env.is_empty(target):
+            self.env.next_move(self, target)
+            return True
+
+        try:
+            receiver = self.env.agents[self.target]
+            if isinstance(receiver, Messenger) and receiver not in self.received_messages:
+                self.send(receiver, LetsTurnMessage(self.id))
+                return True
+        except KeyError:
+            pass
+        return False
+
+    def do_for_empty_or_then_fill(self, positions, empty_handler, fill_handler):
+        empty_positions = []
+        fill_positions = []
+        for pos in positions:
+            if self.env.is_empty(pos):
+                empty_positions.append(pos)
+            else:
+                fill_positions.append(pos)
+
+        while empty_positions:
+            i = random.randint(0, len(empty_positions) - 1)
+            pos = empty_positions[i]
+            if empty_handler(pos):
+                return True
+            empty_positions.pop(i)
+
+        while fill_positions:
+            i = random.randint(0, len(fill_positions) - 1)
+            pos = fill_positions[i]
+            if fill_handler(pos):
+                return True
+            fill_positions.pop(i)
+        return False
+
+    def move_or_send_give_way(self, source, target, priority):
+        def empty_handler(pos):
+            return self.env.next_move(self, pos)
+
+        def fill_handler(pos):
+            try:
+                receiver = self.env.agents[pos]
+                if isinstance(receiver, Messenger) and receiver not in self.received_messages \
+                        and receiver.id > priority and receiver.id != self.id:
+                    return self.send_give_way(receiver, priority)
+            except KeyError:
+                pass
+            return False
+
+        closers = PosMan.get_closers_neighbors(source, target, self.env.n, self.env.get_all_neighbors)
+        return self.do_for_empty_or_then_fill(closers, empty_handler, fill_handler)
